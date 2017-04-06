@@ -50,6 +50,8 @@ use std::collections::HashMap;
 use std::option::Option;
 use iron::headers::ContentType;
 use std::ops::Deref;
+use std::fmt;
+use std::error::Error;
 
 
 fn verify_md5(md5: &str) -> bool {
@@ -60,9 +62,23 @@ fn verify_md5(md5: &str) -> bool {
     MD5_RE.is_match(md5)
 }
 
-
+#[derive(Debug)]
 struct AvatarError {
     pub status: Option<status::Status>,
+}
+
+
+impl fmt::Display for AvatarError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Cannot Fetch Avatar!")
+    }
+}
+
+
+impl Error for AvatarError {
+    fn description(&self) -> &str {
+        "Cannot Fetch Avatar!"
+    }
 }
 
 
