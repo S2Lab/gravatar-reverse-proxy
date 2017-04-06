@@ -1,0 +1,13 @@
+[package]
+name = "gravatar-reverse-proxy"
+version = "0.1.0"
+authors = ["星川かえで <futursolo@icloud.com>"]
+
+[dependencies]
+iron = "0.5.1"
+router = "0.5.1"
+hyper = "0.10"
+lazy_static = "0.2.1"
+regex = "0.2.1"
+hyper-rustls = "0.3.2"
+urlencoded = "0.5.0"
