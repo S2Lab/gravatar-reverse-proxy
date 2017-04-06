@@ -26,24 +26,6 @@ use iron::headers::ContentType;
 use std::ops::Deref;
 
 
-#[derive(Debug, PartialEq, Eq)]
-struct Md5ReCheckFailed;
-
-
-impl fmt::Display for Md5ReCheckFailed {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str("Not a vaild MD5 String!")
-    }
-}
-
-
-impl Error for Md5ReCheckFailed {
-    fn description(&self) -> &str {
-        "Md5 Re Check Failed!"
-    }
-}
-
-
 fn verify_md5(md5: &str) -> bool {
     lazy_static! {
         static ref MD5_RE: Regex = Regex::new("^[0-9a-f]{32}$").unwrap();
@@ -215,10 +197,6 @@ impl AfterMiddleware for CustomErrorMsg {
         let res = self.alter_response(res);
 
         if let Some(_) = err.error.downcast::<NoRoute>() {
-            return Ok(res);
-        }
-
-        if let Some(_) = err.error.downcast::<Md5ReCheckFailed>() {
             return Ok(res);
         }
 
