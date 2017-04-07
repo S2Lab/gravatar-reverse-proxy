@@ -1,4 +1,4 @@
-//!                         The Unlicense
+//!                             The Unlicense
 //! This is free and unencumbered software released into the public domain.
 //!
 //! Anyone is free to copy, modify, publish, use, compile, sell, or
@@ -37,6 +37,7 @@ extern crate urlencoded;
 extern crate persistent;
 extern crate lru_cache;
 extern crate time;
+extern crate crypto_hash;
 
 use std::vec::Vec;
 use hyper::Client as HyperClient;
@@ -52,15 +53,14 @@ use hyper_rustls::TlsClient as RustlsClient;
 use urlencoded::{UrlEncodedQuery, UrlDecodingError};
 use std::collections::HashMap;
 use std::option::Option;
-use iron::headers::{ContentType, ContentDisposition, CacheControl, EntityTag, HttpDate};
-use std::ops::Deref;
-use std::fmt;
-use std::error::Error;
+use iron::headers::{ContentType, ContentDisposition, CacheControl, ContentLength, LastModified,
+                    EntityTag, HttpDate, CacheDirective};
 use lru_cache::LruCache;
 use persistent::Write;
 use iron::typemap::Key;
-use time::PreciseTime;
 use std::result::Result;
+use crypto_hash::{Algorithm as HashAlgorithm, hex_digest};
+use std::ops::Deref;
 
 
 fn verify_md5(md5: &str) -> bool {
@@ -71,24 +71,6 @@ fn verify_md5(md5: &str) -> bool {
     MD5_RE.is_match(md5)
 }
 
-#[derive(Debug)]
-struct AvatarError {
-    pub status: Option<status::Status>,
-}
-
-
-impl fmt::Display for AvatarError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Cannot Fetch Avatar!")
-    }
-}
-
-
-impl Error for AvatarError {
-    fn description(&self) -> &str {
-        "Cannot Fetch Avatar!"
-    }
-}
 
 #[derive(Clone, Eq, PartialEq, Hash)]
 struct CacheControlKey {
@@ -157,20 +139,50 @@ impl CacheControlKey {
 
 
 struct CacheControlData {
-    pub create_time: PreciseTime,
-    pub max_age: u64,
     pub etag: EntityTag,
     pub last_modified: HttpDate,
     pub content_type: ContentType,
     pub content_length: u64,
-    pub content_disposition: ContentDisposition,
+    pub content_disposition: Option<ContentDisposition>,
     pub cache_control: CacheControl,
+    pub expires: HttpDate,
 }
 
 
 impl CacheControlData {
-    fn from_response(res: &HyperResponse) -> AvatarResult<CacheControlData> {
-        panic!();
+    fn from_response(res: &HyperResponse, res_body: &[u8]) -> AvatarResult<CacheControlData> {
+        let etag = EntityTag::strong(hex_digest(HashAlgorithm::SHA256, res_body.to_vec()));
+        let last_modified = res.headers
+            .get::<LastModified>()
+            .map(|m| m.deref().clone())
+            .unwrap_or_else(|| HttpDate(time::now()));
+
+        let content_type = try!(res.headers
+            .get::<ContentType>()
+            .map(|m| m.clone())
+            .ok_or_else(|| Response::with((status::BadGateway))));
+
+        let content_length = try!(res.headers
+            .get::<ContentLength>()
+            .map(|m| m.deref().clone() as u64)
+            .ok_or_else(|| Response::with((status::BadGateway))));
+
+        let content_disposition = res.headers.get::<ContentDisposition>().map(|m| m.clone());
+        let cache_control = res.headers
+            .get::<CacheControl>()
+            .map(|m| m.clone())
+            .unwrap_or_else(|| CacheControl(vec![CacheDirective::MaxAge(600 as u32)]));
+        let expires = HttpDate(time::now() + time::Duration::minutes(10));
+
+        Ok(CacheControlData {
+            etag: etag,
+            last_modified: last_modified,
+            content_type: content_type,
+            content_length: content_length,
+            content_disposition: content_disposition,
+            cache_control: cache_control,
+            expires: expires,
+        })
     }
 }
 
@@ -183,27 +195,25 @@ impl Key for Cache {
 
 
 struct Avatar {
-    pub email_md5: String,
-    pub size: Option<i64>,
-    pub content_type: ContentType,
     pub buf: Vec<u8>,
-    pub cc_key: CacheControlKey, // pub cc_data: CacheControlData,
+    pub cc_key: CacheControlKey,
+    pub cc_data: CacheControlData,
 }
 
 
-type AvatarResult<T> = Result<T, AvatarError>;
+type AvatarResult<T> = Result<T, Response>;
 
 impl Avatar {
-    fn make_origin_url(email_md5: &str, size: Option<i64>, default: Option<String>) -> String {
-        let mut origin_url = format!("https://secure.gravatar.com/avatar/{}", email_md5);
+    fn make_origin_url(cc_key: &CacheControlKey) -> String {
+        let mut origin_url = format!("https://secure.gravatar.com/avatar/{}", cc_key.email_md5);
 
         let mut params: Vec<String> = Vec::new();
 
-        if let Some(m) = size {
+        if let Some(ref m) = cc_key.size {
             params.push(format!("s={}", m));
         }
 
-        if let Some(m) = default {
+        if let Some(ref m) = cc_key.default {
             params.push(format!("d={}", m));
         }
 
@@ -217,25 +227,20 @@ impl Avatar {
 
     pub fn from_response(res: &mut HyperResponse, cc_key: CacheControlKey) -> AvatarResult<Avatar> {
         if res.status != hyper::Ok {
-            return Err(AvatarError { status: Some(res.status) });
+            return Err(Response::with((status::BadGateway)));
         }
 
         let mut avatar_body: Vec<u8> = Vec::new();
 
         try!(res.read_to_end(&mut avatar_body)
-            .map_err(|_| AvatarError { status: Some(status::BadGateway) }));
+            .map_err(|_| Response::with((status::BadGateway))));
 
-        let content_type = try!(res.headers
-                .get::<ContentType>()
-                .ok_or(AvatarError { status: Some(status::BadGateway) }))
-            .clone();
+        let cc_data = try!(CacheControlData::from_response(res, avatar_body.as_slice()));
 
         Ok(Avatar {
-            email_md5: cc_key.email_md5.clone(),
-            size: cc_key.size.clone(),
-            content_type: content_type,
             buf: avatar_body,
             cc_key: cc_key,
+            cc_data: cc_data,
         })
 
     }
@@ -245,13 +250,11 @@ impl Avatar {
             static ref HYPER_CLIENT: HyperClient = HyperClient::with_connector(HttpsConnector::new(RustlsClient::new()));
         }
 
-        let origin_url = Avatar::make_origin_url(cc_key.email_md5.as_str(),
-                                                 cc_key.size.clone(),
-                                                 cc_key.default.clone());
+        let origin_url = Avatar::make_origin_url(&cc_key);
 
         let mut origin_res = try!(HYPER_CLIENT.get(origin_url.as_str())
             .send()
-            .map_err(|_| AvatarError { status: None }));
+            .map_err(|_| Response::with((status::BadGateway))));
 
         Avatar::from_response(&mut origin_res, cc_key)
     }
@@ -279,7 +282,7 @@ fn handler(mut req: &mut Request) -> IronResult<Response> {
         Err(_) => return Ok(Response::with((status::BadGateway))),
     };
 
-    Ok(Response::with((avatar.content_type.deref().clone(), status::Ok, avatar.buf.clone())))
+    Ok(Response::with(((*avatar.cc_data.content_type).clone(), status::Ok, avatar.buf.clone())))
 }
 
 
