@@ -46,21 +46,22 @@ use hyper::net::HttpsConnector;
 use router::{Router, NoRoute};
 use iron::prelude::*;
 use iron::status;
-use iron::AfterMiddleware;
+use iron::{AfterMiddleware, Handler};
 use regex::Regex;
 use std::io::Read;
 use hyper_rustls::TlsClient as RustlsClient;
 use urlencoded::{UrlEncodedQuery, UrlDecodingError};
 use std::collections::HashMap;
 use std::option::Option;
-use iron::headers::{ContentType, ContentDisposition, CacheControl, ContentLength, LastModified,
-                    EntityTag, HttpDate, CacheDirective};
+use iron::headers::{ContentType, ContentDisposition, CacheControl, LastModified, ETag, Expires,
+                    IfModifiedSince, IfNoneMatch, EntityTag, HttpDate, CacheDirective};
 use lru_cache::LruCache;
 use persistent::Write;
 use iron::typemap::Key;
 use std::result::Result;
 use crypto_hash::{Algorithm as HashAlgorithm, hex_digest};
 use std::ops::Deref;
+use std::sync::{Arc, Mutex};
 
 
 fn verify_md5(md5: &str) -> bool {
@@ -72,7 +73,7 @@ fn verify_md5(md5: &str) -> bool {
 }
 
 
-#[derive(Clone, Eq, PartialEq, Hash)]
+#[derive(Clone, Eq, PartialEq, Hash, Debug)]
 struct CacheControlKey {
     email_md5: String,
     size: Option<i64>,
@@ -138,11 +139,11 @@ impl CacheControlKey {
 }
 
 
+#[derive(Clone)]
 struct CacheControlData {
     pub etag: EntityTag,
     pub last_modified: HttpDate,
     pub content_type: ContentType,
-    pub content_length: u64,
     pub content_disposition: Option<ContentDisposition>,
     pub cache_control: CacheControl,
     pub expires: HttpDate,
@@ -162,32 +163,34 @@ impl CacheControlData {
             .map(|m| m.clone())
             .ok_or_else(|| Response::with((status::BadGateway))));
 
-        let content_length = try!(res.headers
-            .get::<ContentLength>()
-            .map(|m| m.deref().clone() as u64)
-            .ok_or_else(|| Response::with((status::BadGateway))));
-
         let content_disposition = res.headers.get::<ContentDisposition>().map(|m| m.clone());
-        let cache_control = res.headers
-            .get::<CacheControl>()
-            .map(|m| m.clone())
-            .unwrap_or_else(|| CacheControl(vec![CacheDirective::MaxAge(600 as u32)]));
+        let cache_control = CacheControl(vec![CacheDirective::MaxAge(600 as u32)]);
         let expires = HttpDate(time::now() + time::Duration::minutes(10));
 
         Ok(CacheControlData {
             etag: etag,
             last_modified: last_modified,
             content_type: content_type,
-            content_length: content_length,
             content_disposition: content_disposition,
             cache_control: cache_control,
             expires: expires,
         })
     }
+
+    fn set_cache_headers(&self, mut res: &mut Response) {
+        res.headers.set(ETag(self.etag.clone()));
+        res.headers.set(LastModified(self.last_modified.clone()));
+        if let Some(m) = self.content_disposition.clone() {
+            res.headers.set(m);
+        }
+        res.headers.set(self.cache_control.clone());
+        res.headers.set(Expires(self.expires.clone()));
+
+    }
 }
 
 
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 struct Cache;
 impl Key for Cache {
     type Value = LruCache<CacheControlKey, CacheControlData>;
@@ -261,30 +264,95 @@ impl Avatar {
 }
 
 
-fn handler(mut req: &mut Request) -> IronResult<Response> {
-    let cache_mutex = req.get::<Write<Cache>>().unwrap();
+struct MainHandler;
 
-    let cc_key = match CacheControlKey::from_request(&mut req) {
-        Ok(v) => v,
-        Err(res) => return Ok(res),
-    };
 
-    {
+impl MainHandler {
+    fn read_from_cache(&self,
+                       cc_key: &CacheControlKey,
+                       cache_mutex: &Arc<Mutex<LruCache<CacheControlKey, CacheControlData>>>)
+                       -> Option<CacheControlData> {
         let mut cache = cache_mutex.lock().unwrap();
 
-        if cache.contains_key(&cc_key) {
-            panic!();
+        let cc_data = match cache.get_mut(cc_key).map(|m| m.clone()) {
+            Some(m) => m,
+            None => return None,
+        };
+
+        if cc_data.expires > HttpDate(time::now()) {
+            Some(cc_data)
+        } else {
+            cache.remove(cc_key);
+            None
         }
     }
 
-    let avatar = match Avatar::fetch(cc_key) {
-        Ok(v) => v,
-        Err(_) => return Ok(Response::with((status::BadGateway))),
-    };
+    fn response_with_200(&self, avatar: &Avatar) -> IronResult<Response> {
+        let mut res = Response::with((avatar.cc_data.content_type.deref().clone(),
+                                      status::Ok,
+                                      avatar.buf.clone()));
 
-    Ok(Response::with(((*avatar.cc_data.content_type).clone(), status::Ok, avatar.buf.clone())))
+        avatar.cc_data.set_cache_headers(&mut res);
+        Ok(res)
+
+    }
+
+    fn response_with_304(&self, cc_data: &CacheControlData) -> IronResult<Response> {
+        let mut res = Response::with((cc_data.content_type.deref().clone(), status::NotModified));
+
+        cc_data.set_cache_headers(&mut res);
+
+        Ok(res)
+    }
 }
 
+
+impl Handler for MainHandler {
+    fn handle(&self, mut req: &mut Request) -> IronResult<Response> {
+        let cache_mutex = req.get::<Write<Cache>>().unwrap();
+
+        let cc_key = match CacheControlKey::from_request(&mut req) {
+            Ok(v) => v,
+            Err(res) => return Ok(res),
+        };
+
+
+
+        let maybe_if_modified_since = req.headers.get::<IfModifiedSince>();
+        let maybe_if_none_match = req.headers.get::<IfNoneMatch>();
+
+        if let Some(if_none_match) = maybe_if_none_match {
+            // Prefer ETag.
+            if let Some(cc_data) = self.read_from_cache(&cc_key, &cache_mutex) {
+                if let &IfNoneMatch::Items(ref items) = if_none_match {
+                    if items.as_slice().contains(&cc_data.etag) {
+                        return self.response_with_304(&cc_data);
+                    }
+                }
+            }
+        } else if let Some(if_modified_since) = maybe_if_modified_since {
+            if let Some(cc_data) = self.read_from_cache(&cc_key, &cache_mutex) {
+                if if_modified_since.deref() == &cc_data.last_modified {
+                    return self.response_with_304(&cc_data);
+                }
+            }
+        }
+
+        let avatar = match Avatar::fetch(cc_key) {
+            Ok(v) => v,
+            Err(res) => return Ok(res),
+        };
+
+
+        let res_result = self.response_with_200(&avatar);
+        {
+            let mut cache = cache_mutex.lock().unwrap();
+
+            cache.insert(avatar.cc_key, avatar.cc_data);
+        }
+        res_result
+    }
+}
 
 struct CustomErrorMsg;
 
@@ -362,7 +430,7 @@ impl AfterMiddleware for XPoweredBy {
 fn main() {
     let mut router = Router::new();
 
-    router.get("/avatar/:email_md5", handler, "email_md5");
+    router.get("/avatar/:email_md5", MainHandler, "email_md5");
 
     let mut chain = Chain::new(router);
     chain.link_after(CustomErrorMsg);
