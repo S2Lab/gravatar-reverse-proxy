@@ -28,6 +28,7 @@
 
 extern crate iron;
 extern crate router;
+#[macro_use]
 extern crate hyper;
 #[macro_use]
 extern crate lazy_static;
@@ -40,28 +41,34 @@ extern crate time;
 extern crate crypto_hash;
 
 use std::vec::Vec;
-use hyper::Client as HyperClient;
-use hyper::client::Response as HyperResponse;
-use hyper::net::HttpsConnector;
-use router::{Router, NoRoute};
-use iron::prelude::*;
-use iron::status;
-use iron::{AfterMiddleware, Handler};
-use regex::Regex;
-use std::io::Read;
-use hyper_rustls::TlsClient as RustlsClient;
-use urlencoded::{UrlEncodedQuery, UrlDecodingError};
-use std::collections::HashMap;
-use std::option::Option;
-use iron::headers::{ContentType, ContentDisposition, CacheControl, LastModified, ETag, Expires,
-                    IfModifiedSince, IfNoneMatch, EntityTag, HttpDate, CacheDirective};
-use lru_cache::LruCache;
-use persistent::Write;
-use iron::typemap::Key;
-use std::result::Result;
-use crypto_hash::{Algorithm as HashAlgorithm, hex_digest};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
+use std::io::Read;
+use std::collections::HashMap;
+use std::option::Option;
+use std::result::Result;
+
+use hyper::client::{Client as HyperClient, Response as HyperResponse};
+use hyper::net::HttpsConnector as HyperHttpsConnector;
+use hyper::status::StatusCode as HyperStatusCode;
+use hyper::header as hyper_header;
+use hyper_rustls::TlsClient as HyperRustlsClient;
+
+use iron::{IronResult, IronError, Iron};
+use iron::{Request as IronRequest, Response as IronResponse, Chain as IronChain,
+           Plugin as IronPlugin};
+use iron::{AfterMiddleware, Handler};
+use iron::typemap::Key;
+
+use router::{Router, NoRoute};
+use urlencoded::{UrlEncodedQuery, UrlDecodingError};
+use persistent::Write;
+
+use regex::Regex;
+use lru_cache::LruCache;
+use crypto_hash::{Algorithm as HashAlgorithm, hex_digest};
+
+header! { (XPoweredBy, "X-Powered-By") => [String] }
 
 
 fn verify_md5(md5: &str) -> bool {
@@ -82,7 +89,7 @@ struct CacheControlKey {
 
 
 impl CacheControlKey {
-    fn from_request(req: &mut Request) -> Result<CacheControlKey, Response> {
+    fn from_request(req: &mut IronRequest) -> Result<CacheControlKey, IronResponse> {
         let email_md5 = req.extensions
             .get::<Router>()
             .unwrap()
@@ -91,7 +98,7 @@ impl CacheControlKey {
             .to_lowercase();
 
         if !verify_md5(email_md5.as_str()) {
-            return Err(Response::with((status::NotFound)));
+            return Err(IronResponse::with((HyperStatusCode::NotFound)));
         }
 
         let maybe_query = req.get::<UrlEncodedQuery>()
@@ -105,7 +112,7 @@ impl CacheControlKey {
 
         let query = match maybe_query {
             Some(m) => m,
-            None => return Err(Response::with((status::BadRequest))),
+            None => return Err(IronResponse::with((HyperStatusCode::BadRequest))),
         };
 
         let size_str = query.get("s")
@@ -124,7 +131,7 @@ impl CacheControlKey {
             Some(m) => {
                 match m.parse::<i64>() {
                     Ok(m) => Some(m),
-                    Err(_) => return Err(Response::with((status::BadRequest))),
+                    Err(_) => return Err(IronResponse::with((HyperStatusCode::BadRequest))),
                 }
             }
             None => None,
@@ -141,31 +148,34 @@ impl CacheControlKey {
 
 #[derive(Clone)]
 struct CacheControlData {
-    pub etag: EntityTag,
-    pub last_modified: HttpDate,
-    pub content_type: ContentType,
-    pub content_disposition: Option<ContentDisposition>,
-    pub cache_control: CacheControl,
-    pub expires: HttpDate,
+    pub etag: hyper_header::EntityTag,
+    pub last_modified: hyper_header::HttpDate,
+    pub content_type: hyper_header::ContentType,
+    pub content_disposition: Option<hyper_header::ContentDisposition>,
+    pub cache_control: hyper_header::CacheControl,
+    pub expires: hyper_header::HttpDate,
 }
 
 
 impl CacheControlData {
     fn from_response(res: &HyperResponse, res_body: &[u8]) -> AvatarResult<CacheControlData> {
-        let etag = EntityTag::strong(hex_digest(HashAlgorithm::SHA256, res_body.to_vec()));
+        let etag = hyper_header::EntityTag::strong(hex_digest(HashAlgorithm::SHA256,
+                                                              res_body.to_vec()));
         let last_modified = res.headers
-            .get::<LastModified>()
+            .get::<hyper_header::LastModified>()
             .map(|m| m.deref().clone())
-            .unwrap_or_else(|| HttpDate(time::now()));
+            .unwrap_or_else(|| hyper_header::HttpDate(time::now()));
 
         let content_type = try!(res.headers
-            .get::<ContentType>()
+            .get::<hyper_header::ContentType>()
             .map(|m| m.clone())
-            .ok_or_else(|| Response::with((status::BadGateway))));
+            .ok_or_else(|| IronResponse::with((HyperStatusCode::BadGateway))));
 
-        let content_disposition = res.headers.get::<ContentDisposition>().map(|m| m.clone());
-        let cache_control = CacheControl(vec![CacheDirective::MaxAge(600 as u32)]);
-        let expires = HttpDate(time::now() + time::Duration::minutes(10));
+        let content_disposition =
+            res.headers.get::<hyper_header::ContentDisposition>().map(|m| m.clone());
+        let cache_control =
+            hyper_header::CacheControl(vec![hyper_header::CacheDirective::MaxAge(600 as u32)]);
+        let expires = hyper_header::HttpDate(time::now() + time::Duration::minutes(10));
 
         Ok(CacheControlData {
             etag: etag,
@@ -177,14 +187,14 @@ impl CacheControlData {
         })
     }
 
-    fn set_cache_headers(&self, mut res: &mut Response) {
-        res.headers.set(ETag(self.etag.clone()));
-        res.headers.set(LastModified(self.last_modified.clone()));
+    fn set_cache_headers(&self, mut res: &mut IronResponse) {
+        res.headers.set(hyper_header::ETag(self.etag.clone()));
+        res.headers.set(hyper_header::LastModified(self.last_modified.clone()));
         if let Some(m) = self.content_disposition.clone() {
             res.headers.set(m);
         }
         res.headers.set(self.cache_control.clone());
-        res.headers.set(Expires(self.expires.clone()));
+        res.headers.set(hyper_header::Expires(self.expires.clone()));
 
     }
 }
@@ -204,7 +214,7 @@ struct Avatar {
 }
 
 
-type AvatarResult<T> = Result<T, Response>;
+type AvatarResult<T> = Result<T, IronResponse>;
 
 impl Avatar {
     fn make_origin_url(cc_key: &CacheControlKey) -> String {
@@ -230,13 +240,13 @@ impl Avatar {
 
     pub fn from_response(res: &mut HyperResponse, cc_key: CacheControlKey) -> AvatarResult<Avatar> {
         if res.status != hyper::Ok {
-            return Err(Response::with((status::BadGateway)));
+            return Err(IronResponse::with((HyperStatusCode::BadGateway)));
         }
 
         let mut avatar_body: Vec<u8> = Vec::new();
 
         try!(res.read_to_end(&mut avatar_body)
-            .map_err(|_| Response::with((status::BadGateway))));
+            .map_err(|_| IronResponse::with((HyperStatusCode::BadGateway))));
 
         let cc_data = try!(CacheControlData::from_response(res, avatar_body.as_slice()));
 
@@ -250,14 +260,14 @@ impl Avatar {
 
     pub fn fetch(cc_key: CacheControlKey) -> AvatarResult<Avatar> {
         lazy_static! {
-            static ref HYPER_CLIENT: HyperClient = HyperClient::with_connector(HttpsConnector::new(RustlsClient::new()));
+            static ref HYPER_CLIENT: HyperClient = HyperClient::with_connector(HyperHttpsConnector::new(HyperRustlsClient::new()));
         }
 
         let origin_url = Avatar::make_origin_url(&cc_key);
 
         let mut origin_res = try!(HYPER_CLIENT.get(origin_url.as_str())
             .send()
-            .map_err(|_| Response::with((status::BadGateway))));
+            .map_err(|_| IronResponse::with((HyperStatusCode::BadGateway))));
 
         Avatar::from_response(&mut origin_res, cc_key)
     }
@@ -279,7 +289,7 @@ impl MainHandler {
             None => return None,
         };
 
-        if cc_data.expires > HttpDate(time::now()) {
+        if cc_data.expires > hyper_header::HttpDate(time::now()) {
             Some(cc_data)
         } else {
             cache.remove(cc_key);
@@ -287,18 +297,19 @@ impl MainHandler {
         }
     }
 
-    fn response_with_200(&self, avatar: &Avatar) -> IronResult<Response> {
-        let mut res = Response::with((avatar.cc_data.content_type.deref().clone(),
-                                      status::Ok,
-                                      avatar.buf.clone()));
+    fn response_with_200(&self, avatar: &Avatar) -> IronResult<IronResponse> {
+        let mut res = IronResponse::with((avatar.cc_data.content_type.deref().clone(),
+                                          HyperStatusCode::Ok,
+                                          avatar.buf.clone()));
 
         avatar.cc_data.set_cache_headers(&mut res);
         Ok(res)
 
     }
 
-    fn response_with_304(&self, cc_data: &CacheControlData) -> IronResult<Response> {
-        let mut res = Response::with((cc_data.content_type.deref().clone(), status::NotModified));
+    fn response_with_304(&self, cc_data: &CacheControlData) -> IronResult<IronResponse> {
+        let mut res = IronResponse::with((cc_data.content_type.deref().clone(),
+                                          HyperStatusCode::NotModified));
 
         cc_data.set_cache_headers(&mut res);
 
@@ -308,7 +319,7 @@ impl MainHandler {
 
 
 impl Handler for MainHandler {
-    fn handle(&self, mut req: &mut Request) -> IronResult<Response> {
+    fn handle(&self, mut req: &mut IronRequest) -> IronResult<IronResponse> {
         let cache_mutex = req.get::<Write<Cache>>().unwrap();
 
         let cc_key = match CacheControlKey::from_request(&mut req) {
@@ -318,13 +329,13 @@ impl Handler for MainHandler {
 
 
 
-        let maybe_if_modified_since = req.headers.get::<IfModifiedSince>();
-        let maybe_if_none_match = req.headers.get::<IfNoneMatch>();
+        let maybe_if_modified_since = req.headers.get::<hyper_header::IfModifiedSince>();
+        let maybe_if_none_match = req.headers.get::<hyper_header::IfNoneMatch>();
 
         if let Some(if_none_match) = maybe_if_none_match {
             // Prefer ETag.
             if let Some(cc_data) = self.read_from_cache(&cc_key, &cache_mutex) {
-                if let &IfNoneMatch::Items(ref items) = if_none_match {
+                if let &hyper_header::IfNoneMatch::Items(ref items) = if_none_match {
                     if items.as_slice().contains(&cc_data.etag) {
                         return self.response_with_304(&cc_data);
                     }
@@ -358,15 +369,15 @@ struct CustomErrorMsg;
 
 
 impl CustomErrorMsg {
-    fn alter_response(&self, res: Response) -> Response {
-        if res.status == Some(status::NotFound) {
-            Response::with((status::NotFound, "HTTP 404: Not Found."))
+    fn alter_response(&self, res: IronResponse) -> IronResponse {
+        if res.status == Some(HyperStatusCode::NotFound) {
+            IronResponse::with((HyperStatusCode::NotFound, "HTTP 404: Not Found."))
 
-        } else if res.status == Some(status::BadRequest) {
-            Response::with((status::BadRequest, "HTTP 400: Bad Request."))
+        } else if res.status == Some(HyperStatusCode::BadRequest) {
+            IronResponse::with((HyperStatusCode::BadRequest, "HTTP 400: Bad Request."))
 
-        } else if res.status == Some(status::BadGateway) {
-            Response::with((status::BadGateway, "HTTP 502: Bad Gateway."))
+        } else if res.status == Some(HyperStatusCode::BadGateway) {
+            IronResponse::with((HyperStatusCode::BadGateway, "HTTP 502: Bad Gateway."))
 
         } else {
             res
@@ -377,11 +388,11 @@ impl CustomErrorMsg {
 
 
 impl AfterMiddleware for CustomErrorMsg {
-    fn after(&self, _: &mut Request, res: Response) -> IronResult<Response> {
+    fn after(&self, _: &mut IronRequest, res: IronResponse) -> IronResult<IronResponse> {
         Ok(self.alter_response(res))
     }
 
-    fn catch(&self, _: &mut Request, err: IronError) -> IronResult<Response> {
+    fn catch(&self, _: &mut IronRequest, err: IronError) -> IronResult<IronResponse> {
         let res = err.response;
         let res = self.alter_response(res);
 
@@ -397,24 +408,24 @@ impl AfterMiddleware for CustomErrorMsg {
 }
 
 
-struct XPoweredBy;
+struct AddXPoweredBy;
 
 
-impl XPoweredBy {
-    fn add_header(&self, res: &mut Response) {
-        res.headers.set_raw("X-Powered-By", vec![b"Rust".to_vec()]);
+impl AddXPoweredBy {
+    fn add_header(&self, res: &mut IronResponse) {
+        res.headers.set(XPoweredBy("Rust".to_owned()));
     }
 }
 
 
-impl AfterMiddleware for XPoweredBy {
-    fn after(&self, _: &mut Request, mut res: Response) -> IronResult<Response> {
+impl AfterMiddleware for AddXPoweredBy {
+    fn after(&self, _: &mut IronRequest, mut res: IronResponse) -> IronResult<IronResponse> {
         self.add_header(&mut res);
 
         Ok(res)
     }
 
-    fn catch(&self, _: &mut Request, err: IronError) -> IronResult<Response> {
+    fn catch(&self, _: &mut IronRequest, err: IronError) -> IronResult<IronResponse> {
         let mut res = err.response;
         let inner_err = err.error;
         self.add_header(&mut res);
@@ -432,9 +443,9 @@ fn main() {
 
     router.get("/avatar/:email_md5", MainHandler, "email_md5");
 
-    let mut chain = Chain::new(router);
+    let mut chain = IronChain::new(router);
     chain.link_after(CustomErrorMsg);
-    chain.link_after(XPoweredBy);
+    chain.link_after(AddXPoweredBy);
 
     chain.link(Write::<Cache>::both(LruCache::new(102400)));
 
