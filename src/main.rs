@@ -56,9 +56,8 @@ use hyper_rustls::TlsClient as HyperRustlsClient;
 
 use iron::{IronResult, IronError, Iron};
 use iron::{Request as IronRequest, Response as IronResponse, Chain as IronChain,
-           Plugin as IronPlugin};
-use iron::{AfterMiddleware, Handler};
-use iron::typemap::Key;
+           Plugin as IronPlugin, AfterMiddleware as IronAfterMiddleware, Handler as IronHandler};
+use iron::typemap::Key as IronTypeMapKey;
 
 use router::{Router, NoRoute};
 use urlencoded::{UrlEncodedQuery, UrlDecodingError};
@@ -89,7 +88,7 @@ struct AvatarCacheKey {
 
 
 impl AvatarCacheKey {
-    fn from_request(req: &mut IronRequest) -> Result<AvatarCacheKey, IronResponse> {
+    fn from_request(req: &mut IronRequest) -> AvatarResult<AvatarCacheKey> {
         let email_md5 = req.extensions
             .get::<Router>()
             .unwrap()
@@ -204,7 +203,7 @@ impl AvatarCacheData {
 struct AvatarCache;
 
 
-impl Key for AvatarCache {
+impl IronTypeMapKey for AvatarCache {
     type Value = LruCache<AvatarCacheKey, AvatarCacheData>;
 }
 
@@ -321,7 +320,7 @@ impl MainHandler {
 }
 
 
-impl Handler for MainHandler {
+impl IronHandler for MainHandler {
     fn handle(&self, mut req: &mut IronRequest) -> IronResult<IronResponse> {
         let avatar_cache_mutex = req.get::<Write<AvatarCache>>().unwrap();
 
@@ -329,8 +328,6 @@ impl Handler for MainHandler {
             Ok(v) => v,
             Err(res) => return Ok(res),
         };
-
-
 
         let maybe_if_modified_since = req.headers.get::<hyper_header::IfModifiedSince>();
         let maybe_if_none_match = req.headers.get::<hyper_header::IfNoneMatch>();
@@ -390,7 +387,7 @@ impl CustomErrorMsg {
 }
 
 
-impl AfterMiddleware for CustomErrorMsg {
+impl IronAfterMiddleware for CustomErrorMsg {
     fn after(&self, _: &mut IronRequest, res: IronResponse) -> IronResult<IronResponse> {
         Ok(self.alter_response(res))
     }
@@ -421,7 +418,7 @@ impl AddXPoweredBy {
 }
 
 
-impl AfterMiddleware for AddXPoweredBy {
+impl IronAfterMiddleware for AddXPoweredBy {
     fn after(&self, _: &mut IronRequest, mut res: IronResponse) -> IronResult<IronResponse> {
         self.add_header(&mut res);
 
