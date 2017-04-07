@@ -81,15 +81,15 @@ fn verify_md5(md5: &str) -> bool {
 
 
 #[derive(Clone, Eq, PartialEq, Hash, Debug)]
-struct CacheControlKey {
+struct AvatarCacheKey {
     email_md5: String,
     size: Option<i64>,
     default: Option<String>,
 }
 
 
-impl CacheControlKey {
-    fn from_request(req: &mut IronRequest) -> Result<CacheControlKey, IronResponse> {
+impl AvatarCacheKey {
+    fn from_request(req: &mut IronRequest) -> Result<AvatarCacheKey, IronResponse> {
         let email_md5 = req.extensions
             .get::<Router>()
             .unwrap()
@@ -137,7 +137,7 @@ impl CacheControlKey {
             None => None,
         };
 
-        Ok(CacheControlKey {
+        Ok(AvatarCacheKey {
             email_md5: email_md5,
             size: size,
             default: default,
@@ -147,7 +147,7 @@ impl CacheControlKey {
 
 
 #[derive(Clone)]
-struct CacheControlData {
+struct AvatarCacheData {
     pub etag: hyper_header::EntityTag,
     pub last_modified: hyper_header::HttpDate,
     pub content_type: hyper_header::ContentType,
@@ -157,8 +157,8 @@ struct CacheControlData {
 }
 
 
-impl CacheControlData {
-    fn from_response(res: &HyperResponse, res_body: &[u8]) -> AvatarResult<CacheControlData> {
+impl AvatarCacheData {
+    fn from_response(res: &HyperResponse, res_body: &[u8]) -> AvatarResult<AvatarCacheData> {
         let etag = hyper_header::EntityTag::strong(hex_digest(HashAlgorithm::SHA256,
                                                               res_body.to_vec()));
         let last_modified = res.headers
@@ -177,7 +177,7 @@ impl CacheControlData {
             hyper_header::CacheControl(vec![hyper_header::CacheDirective::MaxAge(600 as u32)]);
         let expires = hyper_header::HttpDate(time::now() + time::Duration::minutes(10));
 
-        Ok(CacheControlData {
+        Ok(AvatarCacheData {
             etag: etag,
             last_modified: last_modified,
             content_type: content_type,
@@ -201,32 +201,34 @@ impl CacheControlData {
 
 
 #[derive(Clone)]
-struct Cache;
-impl Key for Cache {
-    type Value = LruCache<CacheControlKey, CacheControlData>;
+struct AvatarCache;
+
+
+impl Key for AvatarCache {
+    type Value = LruCache<AvatarCacheKey, AvatarCacheData>;
 }
 
 
 struct Avatar {
     pub buf: Vec<u8>,
-    pub cc_key: CacheControlKey,
-    pub cc_data: CacheControlData,
+    pub ac_key: AvatarCacheKey,
+    pub ac_data: AvatarCacheData,
 }
 
 
 type AvatarResult<T> = Result<T, IronResponse>;
 
 impl Avatar {
-    fn make_origin_url(cc_key: &CacheControlKey) -> String {
-        let mut origin_url = format!("https://secure.gravatar.com/avatar/{}", cc_key.email_md5);
+    fn make_origin_url(ac_key: &AvatarCacheKey) -> String {
+        let mut origin_url = format!("https://secure.gravatar.com/avatar/{}", ac_key.email_md5);
 
         let mut params: Vec<String> = Vec::new();
 
-        if let Some(ref m) = cc_key.size {
+        if let Some(ref m) = ac_key.size {
             params.push(format!("s={}", m));
         }
 
-        if let Some(ref m) = cc_key.default {
+        if let Some(ref m) = ac_key.default {
             params.push(format!("d={}", m));
         }
 
@@ -238,7 +240,7 @@ impl Avatar {
         origin_url
     }
 
-    pub fn from_response(res: &mut HyperResponse, cc_key: CacheControlKey) -> AvatarResult<Avatar> {
+    pub fn from_response(res: &mut HyperResponse, ac_key: AvatarCacheKey) -> AvatarResult<Avatar> {
         if res.status != hyper::Ok {
             return Err(IronResponse::with((HyperStatusCode::BadGateway)));
         }
@@ -248,28 +250,28 @@ impl Avatar {
         try!(res.read_to_end(&mut avatar_body)
             .map_err(|_| IronResponse::with((HyperStatusCode::BadGateway))));
 
-        let cc_data = try!(CacheControlData::from_response(res, avatar_body.as_slice()));
+        let ac_data = try!(AvatarCacheData::from_response(res, avatar_body.as_slice()));
 
         Ok(Avatar {
             buf: avatar_body,
-            cc_key: cc_key,
-            cc_data: cc_data,
+            ac_key: ac_key,
+            ac_data: ac_data,
         })
 
     }
 
-    pub fn fetch(cc_key: CacheControlKey) -> AvatarResult<Avatar> {
+    pub fn fetch(ac_key: AvatarCacheKey) -> AvatarResult<Avatar> {
         lazy_static! {
             static ref HYPER_CLIENT: HyperClient = HyperClient::with_connector(HyperHttpsConnector::new(HyperRustlsClient::new()));
         }
 
-        let origin_url = Avatar::make_origin_url(&cc_key);
+        let origin_url = Avatar::make_origin_url(&ac_key);
 
         let mut origin_res = try!(HYPER_CLIENT.get(origin_url.as_str())
             .send()
             .map_err(|_| IronResponse::with((HyperStatusCode::BadGateway))));
 
-        Avatar::from_response(&mut origin_res, cc_key)
+        Avatar::from_response(&mut origin_res, ac_key)
     }
 }
 
@@ -278,40 +280,41 @@ struct MainHandler;
 
 
 impl MainHandler {
-    fn read_from_cache(&self,
-                       cc_key: &CacheControlKey,
-                       cache_mutex: &Arc<Mutex<LruCache<CacheControlKey, CacheControlData>>>)
-                       -> Option<CacheControlData> {
-        let mut cache = cache_mutex.lock().unwrap();
+    fn read_from_avatar_cache(&self,
+                              ac_key: &AvatarCacheKey,
+                              avatar_cache_mutex: &Arc<Mutex<LruCache<AvatarCacheKey,
+                                                                      AvatarCacheData>>>)
+                              -> Option<AvatarCacheData> {
+        let mut avatar_cache = avatar_cache_mutex.lock().unwrap();
 
-        let cc_data = match cache.get_mut(cc_key).map(|m| m.clone()) {
+        let ac_data = match avatar_cache.get_mut(ac_key).map(|m| m.clone()) {
             Some(m) => m,
             None => return None,
         };
 
-        if cc_data.expires > hyper_header::HttpDate(time::now()) {
-            Some(cc_data)
+        if ac_data.expires > hyper_header::HttpDate(time::now()) {
+            Some(ac_data)
         } else {
-            cache.remove(cc_key);
+            avatar_cache.remove(ac_key);
             None
         }
     }
 
     fn response_with_200(&self, avatar: &Avatar) -> IronResult<IronResponse> {
-        let mut res = IronResponse::with((avatar.cc_data.content_type.deref().clone(),
+        let mut res = IronResponse::with((avatar.ac_data.content_type.deref().clone(),
                                           HyperStatusCode::Ok,
                                           avatar.buf.clone()));
 
-        avatar.cc_data.set_cache_headers(&mut res);
+        avatar.ac_data.set_cache_headers(&mut res);
         Ok(res)
 
     }
 
-    fn response_with_304(&self, cc_data: &CacheControlData) -> IronResult<IronResponse> {
-        let mut res = IronResponse::with((cc_data.content_type.deref().clone(),
+    fn response_with_304(&self, ac_data: &AvatarCacheData) -> IronResult<IronResponse> {
+        let mut res = IronResponse::with((ac_data.content_type.deref().clone(),
                                           HyperStatusCode::NotModified));
 
-        cc_data.set_cache_headers(&mut res);
+        ac_data.set_cache_headers(&mut res);
 
         Ok(res)
     }
@@ -320,9 +323,9 @@ impl MainHandler {
 
 impl Handler for MainHandler {
     fn handle(&self, mut req: &mut IronRequest) -> IronResult<IronResponse> {
-        let cache_mutex = req.get::<Write<Cache>>().unwrap();
+        let avatar_cache_mutex = req.get::<Write<AvatarCache>>().unwrap();
 
-        let cc_key = match CacheControlKey::from_request(&mut req) {
+        let ac_key = match AvatarCacheKey::from_request(&mut req) {
             Ok(v) => v,
             Err(res) => return Ok(res),
         };
@@ -334,22 +337,22 @@ impl Handler for MainHandler {
 
         if let Some(if_none_match) = maybe_if_none_match {
             // Prefer ETag.
-            if let Some(cc_data) = self.read_from_cache(&cc_key, &cache_mutex) {
+            if let Some(ac_data) = self.read_from_avatar_cache(&ac_key, &avatar_cache_mutex) {
                 if let &hyper_header::IfNoneMatch::Items(ref items) = if_none_match {
-                    if items.as_slice().contains(&cc_data.etag) {
-                        return self.response_with_304(&cc_data);
+                    if items.as_slice().contains(&ac_data.etag) {
+                        return self.response_with_304(&ac_data);
                     }
                 }
             }
         } else if let Some(if_modified_since) = maybe_if_modified_since {
-            if let Some(cc_data) = self.read_from_cache(&cc_key, &cache_mutex) {
-                if if_modified_since.deref() == &cc_data.last_modified {
-                    return self.response_with_304(&cc_data);
+            if let Some(ac_data) = self.read_from_avatar_cache(&ac_key, &avatar_cache_mutex) {
+                if if_modified_since.deref() == &ac_data.last_modified {
+                    return self.response_with_304(&ac_data);
                 }
             }
         }
 
-        let avatar = match Avatar::fetch(cc_key) {
+        let avatar = match Avatar::fetch(ac_key) {
             Ok(v) => v,
             Err(res) => return Ok(res),
         };
@@ -357,9 +360,9 @@ impl Handler for MainHandler {
 
         let res_result = self.response_with_200(&avatar);
         {
-            let mut cache = cache_mutex.lock().unwrap();
+            let mut avatar_cache = avatar_cache_mutex.lock().unwrap();
 
-            cache.insert(avatar.cc_key, avatar.cc_data);
+            avatar_cache.insert(avatar.ac_key, avatar.ac_data);
         }
         res_result
     }
@@ -447,7 +450,7 @@ fn main() {
     chain.link_after(CustomErrorMsg);
     chain.link_after(AddXPoweredBy);
 
-    chain.link(Write::<Cache>::both(LruCache::new(102400)));
+    chain.link(Write::<AvatarCache>::both(LruCache::new(102400)));
 
     Iron::new(chain).http("localhost:3000").unwrap();
 }
